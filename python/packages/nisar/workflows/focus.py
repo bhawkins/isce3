@@ -1604,6 +1604,16 @@ def get_caltone_algorithm(cfg, fc, fs, n, is_dithered):
 
     return algorithm, wavelets
 
+
+def get_azimuth_window(cfg: Struct):
+    kind, shape = check_window_input(cfg.processing.azimuth_window,
+        msg="Azimuth window  ")
+    if (kind == "cosine" and shape == 1) or (kind == "kaiser" and shape == 0):
+        log.info("Azimuth window disabled based on shape parameter.")
+        return None
+    return get_window_approximation(kind, shape)
+
+
 def focus(runconfig, runconfig_path=""):
     # Strip off two leading namespaces.
     cfg = runconfig.runconfig.groups
@@ -1802,9 +1812,7 @@ def focus(runconfig, runconfig_path=""):
 
 
     rfi_results = defaultdict(list)
-
-    azwin = get_window_approximation(*check_window_input(
-        cfg.processing.azimuth_window, msg="Azimuth window  "))
+    azwin = get_azimuth_window(cfg)
 
     # main processing loop
     for channel_out in common_mode:
