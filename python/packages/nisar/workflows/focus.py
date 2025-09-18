@@ -1832,8 +1832,15 @@ def focus(runconfig, runconfig_path=""):
             else:
                 regridfd = temp("_regrid.c8")
                 log.info(f"Resampling non-uniform raw data to {regridfd.name}.")
-                regridded = resample(raw_clean, raw_times, raw_grid, swaths, orbit,
-                                    dop[frequency], fn=regridfd,
+                log.info("Marking bypass and LNA cal pulses as invalid for presum")
+                cal_type = raw.getCalType(channel_in.freq_id, pol[0])
+                cal_mask = ((cal_type == nisar.antenna.CalPath.LNA)
+                    | (cal_type == nisar.antenna.CalPath.BYPASS))
+                swaths_ps = swaths.copy()
+                swaths_ps[:, cal_mask, :] = 0
+
+                regridded = resample(raw_clean, raw_times, raw_grid, swaths_ps,
+                                    orbit, dop[frequency], fn=regridfd,
                                     L=cfg.processing.nominal_antenna_size.azimuth)
 
 

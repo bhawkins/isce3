@@ -550,6 +550,10 @@ def fill_gaps(data, swaths, value=np.complex64(0)):
             [swath for swath in pulse_swaths if swath[1] > swath[0]]
         )
         num_swaths = pulse_swaths.shape[0]
+        # Edge case of no valid data (e.g., bypass cal).
+        if num_swaths == 0:
+            yield slice(None)
+            return
         # Gap leading up to first swath.
         yield slice(None, pulse_swaths[0, 0])
         # Gaps between swaths.
