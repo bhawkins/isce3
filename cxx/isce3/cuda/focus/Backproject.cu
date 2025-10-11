@@ -312,6 +312,37 @@ __global__ void estimateDryTropoDelayTSX(double* tau_atm, const Vec3* p,
     tau_atm[tid] = dryTropoDelayTSX(p[tid], llh[tid], ellipsoid);
 }
 
+template <typename T>
+__device__ int lower_bound(const T* data, int n, const T& value)
+{
+    int first = 0, last = n;
+    while (first < last) {
+        int mid = first + (last - first) / 2;
+        if (data[mid] < value) {
+            first = mid + 1;
+        } else {
+            last = mid;
+        }
+    }
+    return first;
+}
+
+template <typename T>
+__device__ int upper_bound(const T* data, int n, const T& value)
+{
+    int first = 0, last = n;
+    while (first < last) {
+        int mid = first + ((last - first) >> 1);
+        if (!(value < data[mid])) {  // i.e. data[mid] <= value
+            first = mid + 1;
+        } else {
+            last = mid;
+        }
+    }
+    return first;
+}
+
+
 /**
  * \internal
  * Estimate coherent processing window bounds for one or more targets.
@@ -366,12 +397,12 @@ __global__ void getCPIBounds(int* kstart_out, int* kstop_out,
     const double tstop = t + 0.5 * cpi;
 
     // convert CPI bounds to pulse indices
-    thrust::device_ptr<double> begin(azimuth_time);
-    const auto kstart = thrust::lower_bound(begin, begin + np, tstart);
-    const auto kstop = thrust::upper_bound(begin + kstart, begin + np, tstop);
+    const auto kstart = lower_bound(azimuth_time, np, tstart);
+    const auto kstop = kstart + upper_bound(
+        azimuth_time + kstart, np - kstart, tstop);
 
-    kstart_out[tid] = static_cast<int>(thrust::distance(begin, kstart));
-    kstop_out[tid] = static_cast<int>(thrust::distance(begin, kstop));
+    kstart_out[tid] = static_cast<int>(kstart);
+    kstop_out[tid] = static_cast<int>(kstop);
 }
 
 /**
@@ -642,7 +673,8 @@ ErrorCode backproject(std::complex<float>* out,
         getCPIBounds<<<grid, block>>>(
                 kstart.data().get(), kstop.data().get(), t.data().get(),
                 r.data().get(), x.data().get(), p.data().get(), v.data().get(),
-                out_grid_size, pulse_times.data(), pulse_times.size(), wvl, ds);
+                out_grid_size, pulse_times.data().get(), pulse_times.size(),
+                wvl, ds);
 
         checkCudaErrors(cudaPeekAtLastError());
         checkCudaErrors(cudaStreamSynchronize(cudaStreamDefault));
