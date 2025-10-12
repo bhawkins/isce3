@@ -1885,20 +1885,22 @@ def focus(runconfig, runconfig_path=""):
                 (rfi_likelihood, raw_clean.shape[0]))
             del raw_mm, rawfd
 
-            presum_times = np.array(raw_grid.sensing_times)
             uniform_pri = not raw.isDithered(channel_in.freq_id)
             if uniform_pri:
                 log.info("Uniform PRF, using raw data directly.")
                 regridded, regridfd = raw_clean, None
+                presum_times = np.array(raw_grid.sensing_times)
             elif cfg.processing.is_enabled.presum_blu:
                 regridfd = temp(f"_{frequency}{pol}_regrid.c8")
                 log.info(f"Resampling non-uniform raw data to {regridfd.name}.")
                 regridded = resample(raw_clean, raw_times, raw_grid, swaths,
                                     flown_orbit, dop[frequency], fn=regridfd,
                                     L=cfg.processing.nominal_antenna_size.azimuth)
+                presum_times = np.array(raw_grid.sensing_times)
             else:
                 log.info("Using non-uniform pulse times without any"
                     " gap-filling or resampling step.")
+                regridded, regridfd = raw_clean, None
                 presum_times = raw_times
 
             # Do range compression.
