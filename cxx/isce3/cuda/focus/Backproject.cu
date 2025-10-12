@@ -69,40 +69,6 @@ namespace {
 
 /**
  * \internal
- * Interpolate platform position and velocity at a range of uniformly-spaced
- * timepoints.
- *
- * The global error code is set if any thread encounters an error.
- *
- * \param[out] pos   Interpolated positions (m)
- * \param[out] vel   Interpolated velocities (m/s)
- * \param[in]  orbit Platform orbit
- * \param[in]  t     Interpolation times w.r.t. reference epoch (s)
- * \param[out] errc  Error flag
- */
-__global__ void interpolateOrbit(Vec3* pos, Vec3* vel,
-                                 const DeviceOrbitView orbit,
-                                 const Linspace<double> t, ErrorCode* errc)
-{
-    // thread index (1d grid of 1d blocks)
-    const auto tid = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-
-    // bounds check
-    if (tid >= t.size()) {
-        return;
-    }
-
-    // interpolate orbit
-    const auto status = orbit.interpolate(&pos[tid], &vel[tid], t[tid]);
-
-    // check error code
-    if (status != ErrorCode::Success) {
-        *errc = status;
-    }
-}
-
-/**
- * \internal
  * Interpolate platform position and velocity at a series of timepoints.
  *
  * The global error code is set if any thread encounters an error.
@@ -527,13 +493,12 @@ ErrorCode backproject(std::complex<float>* out,
     thrust::device_vector<ErrorCode> errc(1, ErrorCode::Success);
 
     // get input & output radar grid azimuth time & slant range coordinates
-    const Linspace<double> in_azimuth_time = in_geometry.sensingTime();
     const Linspace<double> in_slant_range = in_geometry.slantRange();
     const Linspace<double> out_azimuth_time = out_geometry.sensingTime();
     const Linspace<double> out_slant_range = out_geometry.slantRange();
 
     // interpolate platform position & velocity at each pulse
-    int in_lines = in_azimuth_time.size();
+    int in_lines = pulse_times.size();
     thrust::device_vector<Vec3> pos(in_lines);
     thrust::device_vector<Vec3> vel(in_lines);
 
@@ -542,8 +507,9 @@ ErrorCode backproject(std::complex<float>* out,
         const unsigned grid = (in_lines + block - 1) / block;
 
         interpolateOrbit<<<grid, block>>>(pos.data().get(), vel.data().get(),
-                                          in_geometry.orbit(), in_azimuth_time,
-                                          errc.data().get());
+                                          in_geometry.orbit(),
+                                          pulse_times.data().get(),
+                                          in_lines, errc.data().get());
 
         checkCudaErrors(cudaPeekAtLastError());
         checkCudaErrors(cudaStreamSynchronize(cudaStreamDefault));
