@@ -1953,8 +1953,6 @@ def focus(runconfig, runconfig_path=""):
             # Precompute antenna patterns at downsampled spacing
             if cfg.processing.is_enabled.eap:
                 antpat = AntennaPattern(raw, dem, antparser,
-                                        instparser, orbit, attitude,
-                                        el_lut=el_lut)
                                         instparser, flown_orbit, attitude,
                                         el_lut=el_lut)
 
