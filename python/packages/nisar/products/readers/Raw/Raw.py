@@ -713,7 +713,7 @@ class RawBase(Base, family='nisar.productreader.raw'):
         return swaths
 
 
-    def getSubSwathBboxes(self, frequency, tx=None, epoch=None):
+    def getSubSwathBboxes(self, frequency, polarization=None, epoch=None, num_ignore=0):
         """
         Return the bounding box for each sub-swath.
 
@@ -721,63 +721,99 @@ class RawBase(Base, family='nisar.productreader.raw'):
         ----------
         frequency : {"A", "B"}
             Sub-band identifier.
-        tx : {"H", "V", "L", "R"} | None
-            Transmit polarization. If None, use first available TX polarization.
+        polarization : {'HH', 'HV', 'VH', 'VV', 'RH','RV', 'LH', 'LV'}, optional
+            Transmit-Receive polarization. If not specified, the first
+            polarization in the `frequency` band will be used.
         epoch : isce3.core.DateTime
             Reference epoch for azimuth time tags.
+        num_ignore : int, optional
+            Number of pulses to ignore at the end of an observation.  This
+            option is useful when a fixed-PRF observation is followed by a
+            dithered-PRF one, in which case the gaps in the last few receive
+            windows will have irregular spacing due to the dithered pulses in
+            the air.
 
         Returns
         -------
-        bboxes : list[RadarBoundingBox]
-            Bounding box in radar coordinates for each sub-swath.
+        bboxes : list[list[RadarBoundingBox]]
+            Bounding box in radar coordinates for each sub-swath for each
+            segment of constant data window position/length.
         """
-        if tx is None:
-            tx = self.polarizations[frequency][0][0]
+        if polarization is None:
+            polarization = self.polarizations[frequency][0]
+        tx = polarization[0]
         times, grid = self.getRadarGrid(frequency, tx, epoch=epoch)
+        nt, nr = grid.shape
+        subswaths = self.getSubSwaths(frequency, tx=tx)
+        is_dithered = self.isDithered(frequency, tx=tx, num_ignore=num_ignore)
+        rd, wd, wl = self.getRdWdWl(frequency, polarization)
 
-        # If dithered we can reconstruct the entire swath.
-        if self.isDithered(frequency):
-            bbox = RadarBoundingBox(
-                RadarPoint(times[0], grid.slant_ranges[0]),
-                RadarPoint(times[-1], grid.slant_ranges[-1]))
-            return [bbox]
+        # Replace enormous fill values with number of samples.
+        subswaths = np.where(subswaths > nr, nr, subswaths)
 
-        # Otherwise the TX gaps split the swath into sub-swaths.
-        bboxes = []
-        for swath in self.getSubSwaths(frequency, tx=tx):
-            # For fixed PRF the gap locations should be constant (one unique
-            # pair of [start, stop) indices).
-            if len(np.unique(swath, axis=0)) > 1:
-                log.warning("Variable raw subswaths detected!  Only "
-                    "the swath bounds at the azimuth midpoint will be used.")
+        # Replace last num_ignore pulses with previous value.
+        if (not is_dithered) and (num_ignore > 0):
+            # Avoid problems with trivially short observations, though this
+            # shouldn't ever happen.
+            num_ignore = min(num_ignore, nt)
+            subswaths[:, -num_ignore:, :] = subswaths[:, -num_ignore, :]
 
-            # XXX Careful because radar can transition from constant PRF to
-            # XXX dithered PRF, so the pulses in the air at the end will cause
-            # XXX variations in the gap locations at the end.
-            imid = swath.shape[0] // 2
-            istart, iend = swath[imid, :]
+        # For dithered replace subswaths (gap mask) with a single subswath
+        # that merely tracks min/max valid sample.  Note that gaps may still
+        # interfere with min/max, though.
+        if is_dithered:
+            # Determine non-empty ranges.
+            starts, ends = subswaths[..., 0], subswaths[..., 1]
+            valid = ends > starts
+            # Construct masked arrays to simplify stats.
+            starts = np.ma.array(subswaths[..., 0], mask=~valid)
+            ends = np.ma.array(subswaths[..., 1], mask=~valid)
 
-            r = np.array(grid.slant_ranges)
-            n = len(r)
+            # Get masked min and max valid sample for each pulse.
+            min_starts = np.min(starts, axis=0)
+            max_ends = np.max(ends, axis=0)
 
-            # This transition can also force the introduction of a mostly
-            # empty subswath that's only needed at the end (e.g., only two
-            # gaps except dithering introduces a third).
-            # XXX Empty subswaths should be detectable by istart==iend, but
-            # XXX currently L0B can be populated with weird stuff like
-            # XXX [istart, fillValue) or [fillValue, n) where istart < n and
-            # XXX fillValue > n.  So handle that until L0B writer is fixed.
-            istart = min(istart, n)
-            iend = min(iend, n)
-            if istart >= iend:
-                log.warning(f"Excluding subswath with bounds {swath[imid, :]}.")
+            # Now replace subswaths with a single subswath with start/end
+            # so we can use same logic as fixed PRF below.
+            subswaths = np.vstack((min_starts, max_ends)).transpose().reshape(
+                (1, -1, 2))
+
+        changes = get_dwp_change_indices(rd, wd, wl)
+
+        # Append first and last pulses to generate pairs of constant DWP.
+        breaks = np.hstack(([0], changes, [grid.shape[0] - 1]))
+        bbox_lists = []
+        for ibreak in range(len(breaks) - 1):
+            ipulse0, ipulse1 = breaks[ibreak], breaks[ibreak + 1]
+            t0, t1 = times[ipulse0], times[ipulse1]  # one past end point
+            bboxes = []
+            for iswath, (j0, j1) in enumerate(subswaths[:, ipulse0, :]):
+                # Exclude empty subswaths.
+                if j1 <= j0:
+                    continue
+                # If dithered peek ahead in case gap overlaps start or end of
+                # valid swath.  Only need to check one pulse ahead assuming
+                # dither sequence is correctly designed to avoid consecutive
+                # gaps.
+                if is_dithered:
+                    assert iswath == 0  # due to restructuring above
+                    assert ipulse0 < (nt - 1)  # from construction of breaks
+                    j0next = subswaths[iswath, ipulse0 + 1, 0]
+                    j1next = subswaths[iswath, ipulse0 + 1, 1]
+                    if j1next > j0next:
+                        j0 = min(j0, j0next)
+                        j1 = max(j1, j1next)
+                r0 = grid.slant_ranges[j0]
+                r1 = grid.slant_ranges[j1 - 1] + grid.slant_ranges.spacing
+                bboxes.append(RadarBoundingBox(
+                    RadarPoint(t0, r0),
+                    RadarPoint(t1, r1)))
+            if len(bboxes) == 0:
+                log.warning(f"no valid subswath for time interval [{t0}, {t1})")
                 continue
+            bbox_lists.append(bboxes)
 
-            bbox = RadarBoundingBox(
-                RadarPoint(times[0], r[istart]),
-                RadarPoint(times[-1], r[iend - 1]))
-            bboxes.append(bbox)
-        return bboxes
+        return bbox_lists
 
 
     def getProductLevel(self):
@@ -899,6 +935,130 @@ class LegacyRaw(RawBase, family='nisar.productreader.raw'):
         qs = [body2ecef * self.rcs2body for body2ecef in old.quaternions]
         return isce3.core.Attitude(old.time, qs, old.reference_epoch)
 
+
+def get_subswath_changes(subswaths, is_dithered, nr, num_ignore=0):
+    """
+    Figure out the pulses where the data window position (range timing) changes.
+
+    Parameters
+    ----------
+    subswaths : np.ndarray
+        An array of indices denoting where raw data are valid (e.g., not
+        within a transmit gap).  Shape is (ns, nt, 2) where ns is the number of
+        sub-swaths and nt is the number of pulse times.  Each pair of numbers
+        indicates the [start, end) valid samples.
+    is_dithered : bool
+        Whether to consider the observation dithered.  If True, then only
+        consider the min start and max end valid indices across all subswaths,
+        assuming the gaps can be filled.
+    nr : int
+        Upper bound on range sample indices.  Useful for dealing with large
+        and/or inconsistent fill values.
+    num_ignore : int, optional
+        Number of pulses at the end of the observation in which gap location
+        changes will be ignored.  Uuseful for constant-PRF observations followed
+        by dithered observations, where only the last few gaps will be
+        irregular.
+
+    Returns
+    -------
+    changes : np.ndarray
+        Pulse indices where DWP changes.  Can have size=0.
+    """
+    # Replace enormous fill values with number of samples.
+    subswaths = np.where(subswaths > nr, nr, subswaths)
+
+    # Replace last num_ignore pulses with previous value.
+    if num_ignore > 0:
+        # Avoid problems with trivially short observations, though this
+        # shouldn't ever happen.
+        num_ignore = min(num_ignore, subswaths.shape[1])
+        # NOTE where() above creates a copy, so safe to modify in-place
+        subswaths[:, -num_ignore:, :] = subswaths[:, -num_ignore, :]
+
+    # Determine non-empty ranges.
+    starts, ends = subswaths[..., 0], subswaths[..., 1]
+    valid = ends > starts
+    # Construct masked arrays to simplify stats.
+    starts = np.ma.array(subswaths[..., 0], mask=~valid)
+    ends = np.ma.array(subswaths[..., 1], mask=~valid)
+
+    # Get min and max valid sample for each pulse.
+    min_starts = np.min(starts, axis=0)
+    max_ends = np.max(ends, axis=0)
+
+    # If dithered we can reconstruct everything between the min & max
+    # valid samples.  However, we have to be careful due to changing DWP
+    # and gaps that intersect the swath start/end samples.
+    if is_dithered:
+        # Filter out gaps that intersect with the edges of the swath,
+        # assuming the dither sequence was correctly designed so that we
+        # never get a gap in the same spot on consecutive pulses.
+        for i in range(1, len(min_starts) - 1):
+            prev, cur, next_ = min_starts[i - 1 : i + 2]
+            # We might replace cur only when prev == next_, but then we'd
+            # miss cases with an intersecting gap preceding a DWP change.
+            # Let's relax the condition slightly so we at least catch cases
+            # where the gap pushes the first valid sample further than the
+            # DWP change.  Cartoon of first valid samples where `b` is
+            # artifically large due to a transmit gap crossing the DWP:
+            #   a-----------------------------------------------------------
+            #   a-----------------------------------------------------------
+            #               b-----------------------------------------------
+            #       c-------------------------------------------------------
+            #       c-------------------------------------------------------
+            if (cur > prev) and (cur > next_):
+                min_starts[i] = prev
+            # Similar heuristic for the last valid sample.
+            prev, cur, next_ = max_ends[i - 1 : i + 2]
+            if (cur < prev) and (cur < next_):
+                max_ends[i] = prev
+
+        # Now replace subswaths with a single subswath with start/end
+        # so we can use same logic as fixed PRF below.
+        subswaths = np.vstack((min_starts, max_ends)).transpose().reshape(
+            (1, -1, 2))
+
+    all_changes = np.where(
+        (np.diff(min_starts) != 0) | (np.diff(max_ends) != 0))[0]
+
+    # The dither filter might leave a few places where a gap intersects the
+    # swath edge right before/after a DWP change, so filter those out.
+    spurious_changes = all_changes[:-1][np.diff(all_changes) == 1]
+    num_spurious = len(spurious_changes)
+    if num_spurious > 0:
+        log.warning(f"Filtered out {num_spurious} spurious DWP changes.")
+
+    return np.array(sorted(set(all_changes) - set(spurious_changes)),
+        dtype=np.int64)  # avoid float64 for empty set
+
+
+def get_dwp_change_indices(rd, wd, wl):
+    """
+    Determine the pulses where the data window position changes.
+
+    Parameters
+    ----------
+    rd, wd, wl : np.ndarray
+        Arrays with shape (num_channels, num_pulses) containing the range delay,
+        window delay, and window length DBF parameters.  They must all be
+        provided in the same units.
+
+    Returns
+    -------
+    indices : np.ndarray
+        The pulses i where either the min(RD+WD) or the max(RD+WD+WL) changes.
+        That is the pulse at i will have a different data window position than
+        pulse (i - 1).
+    """
+    if not (rd.shape == wd.shape == wl.shape):
+        raise ValueError("shape mismatch among inputs")
+    if not rd.ndim == 2:
+        raise ValueError("expected 2D input data")
+    start = np.min(rd + wd, axis=1).astype(np.int64)
+    end = np.max(rd + wd + wl, axis=1).astype(np.int64)
+    location = np.vstack((start, end))
+    return np.where(np.any(np.diff(location, axis=1) != 0, axis=0))[0] + 1
 
 
 class Raw(RawBase, family='nisar.productreader.raw'):
