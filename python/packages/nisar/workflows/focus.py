@@ -1558,7 +1558,8 @@ def get_focused_sub_swaths(rawlist, out_chan, grid, flown_orbit, doppler, dem,
         raw_bbox_lists.extend(bbox_lists)
 
         txpol = raw_chan.pol[0]
-        chirp_durations.append(raw.getChirpParameters(freq, txpol)[3])
+        T = raw.getChirpParameters(freq, txpol)[3]
+        chirp_durations.extend(len(bbox_lists) * [T])
 
     try:
         swaths = isce3.focus.get_focused_sub_swaths(raw_bbox_lists,
