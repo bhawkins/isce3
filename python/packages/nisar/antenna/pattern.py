@@ -355,7 +355,9 @@ class AntennaPattern:
                     rg_spacing_min=self.rg_spacing_min)
 
     def form_pattern(self, tseq, slant_range: Linspace,
-                     nearest: bool = False, txrx_pols=None):
+                     nearest: bool = False, txrx_pols = None,
+                     ta_offset: float = 0.0,
+                     tx_weights = None, rx_weights = None):
         """
         Get the two-way antenna pattern at a given time and set of ranges for
         either all or specified polarization combinations if Tx/Rx pols are
@@ -374,6 +376,15 @@ class AntennaPattern:
             operation).
         txrx_pols : Optional[Iterable[str]]
             List of TxRx pols to use. Default is all available pols.
+        ta_offset : float, optional
+            Range offset (in meters) to add to DBF range vector.  Useful when
+            slant_range is referenced to a transmit time different from the one
+            used for DBF (e.g., the delay between A and B transmit).
+            Default is zero.
+        tx_weights : numpy.ndarray[complex]
+            Additional complex weights to apply to transmit channels (all pols)
+        rx_weights : numpy.ndarray[complex]
+            Additional complex weights to apply to receive channels (all pols)
 
         Returns
         -------
@@ -430,9 +441,13 @@ class AntennaPattern:
                     el_lut=self.el_lut,
                     norm_weight=self.rx_dbf[rxp].norm_weight)
 
+                if rx_weights is None:
+                    rx_weights = np.ones_like(self.channel_adj_fact_rx[rxp])
+
                 pat = self.rx_dbf[rxp].form_pattern(
                     tgroup, slant_range,
-                    channel_adj_factors=channel_adj_fact_rx
+                    channel_adj_factors=rx_weights * channel_adj_fact_rx,
+                    ta_offset=ta_offset
                 )
                 # Initialize the pattern array so we can slice this
                 # range timing group into it
@@ -454,27 +469,33 @@ class AntennaPattern:
         )
         for tx_pol in {pol[0] for pol in txrx_pols}:
             if tx_pol == "L":
+                if tx_weights is None:
+                    tx_weights = np.ones_like(self.channel_adj_fact_tx["H"])
                 tx_bmf_pat[tx_pol] = (
                     self.tx_bmf['H'].form_pattern(
                         tseq, slant_range, nearest=nearest,
-                        channel_adj_factors=self.channel_adj_fact_tx['H']) +
+                        channel_adj_factors = tx_weights * self.channel_adj_fact_tx['H']) +
                     1j * self.tx_bmf['V'].form_pattern(
                         tseq, slant_range, nearest=nearest,
-                        channel_adj_factors=self.channel_adj_fact_tx['V'])
+                        channel_adj_factors = tx_weights * self.channel_adj_fact_tx['V'])
                 ).astype(np.complex64)
 
             elif tx_pol == "R":
+                if tx_weights is None:
+                    tx_weights = np.ones_like(self.channel_adj_fact_tx["H"])
                 tx_bmf_pat[tx_pol] = (
                     self.tx_bmf['H'].form_pattern(
                         tseq, slant_range, nearest=nearest,
-                        channel_adj_factors=self.channel_adj_fact_tx['H']) -
+                        channel_adj_factors = tx_weights * self.channel_adj_fact_tx['H']) -
                     1j * self.tx_bmf['V'].form_pattern(
                         tseq, slant_range, nearest=nearest,
-                        channel_adj_factors=self.channel_adj_fact_tx['V'])
+                        channel_adj_factors = tx_weights * self.channel_adj_fact_tx['V'])
                 ).astype(np.complex64)
 
             else:  # other non-compact pol types
-                adj = self.channel_adj_fact_tx[tx_pol]
+                if tx_weights is None:
+                    tx_weights = np.ones_like(self.channel_adj_fact_tx[tx_pol])
+                adj = tx_weights * self.channel_adj_fact_tx[tx_pol]
                 tx_bmf_pat[tx_pol] = self.tx_bmf[tx_pol].form_pattern(
                     tseq, slant_range, nearest=nearest, channel_adj_factors=adj
                 ).astype(np.complex64)

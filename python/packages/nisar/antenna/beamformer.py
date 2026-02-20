@@ -537,7 +537,7 @@ class RxDBF(ElevationBeamformer):
     def slant_range_dbf(self):
         return self._slant_range_dbf
 
-    def form_pattern(self, pulse_time, slant_range, channel_adj_factors=None):
+    def form_pattern(self, pulse_time, slant_range, channel_adj_factors=None, ta_offset=0.0):
         """
         Form receive digitally beamformed (DBF) pattern, as a function
         of slant range @ each azimuth pulse time.
@@ -557,6 +557,11 @@ class RxDBF(ElevationBeamformer):
             channel. The size is total number of RX channels. If None,
             no correction will be applied to RX weights. Note that these
             factors will NOT be peak/power normalized.
+        ta_offset : float, optional
+            Range offset (in meters) to add to DBF range vector.  Useful when
+            slant_range is referenced to a transmit time different from the one
+            used for DBF (e.g., the delay between A and B transmit).
+            Default is zero.
 
         Returns
         -------
@@ -606,7 +611,7 @@ class RxDBF(ElevationBeamformer):
 
         # resample RX weightings to the output slant range
         # use simply nearest neighbor given RX weights are very finely sampled!
-        idx_sr = np.rint((sr - self.slant_range_dbf.first) /
+        idx_sr = np.rint((sr - (self.slant_range_dbf.first + ta_offset)) /
                          self.slant_range_dbf.spacing)
         idx_sr = np.clip(idx_sr.astype(int), 0, self.slant_range_dbf.size - 1)
         rx_wgt = self.weights[:, idx_sr]
