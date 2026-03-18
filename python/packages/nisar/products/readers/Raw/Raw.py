@@ -1,5 +1,6 @@
 from __future__ import annotations
 from .DataDecoder import DataDecoder
+from functools import cached_property
 import h5py
 import isce3
 from isce3.focus import RadarPoint, RadarBoundingBox
@@ -186,9 +187,17 @@ class RawBase(Base, family='nisar.productreader.raw'):
         with h5py.File(self.filename, 'r', libver='latest', swmr=True) as f:
             return f[tx_path]["rangeBandwidth"][()]
 
-    @property
+    @cached_property
     def TelemetryPath(self):
-        return f"{self.ProductPath}/lowRateTelemetry"
+        key = f"{self.ProductPath}/lowRateTelemetry"
+        with h5py.File(self.filename, 'r', libver='latest', swmr=True) as f:
+            if key in f:
+                return key
+            # SSAR difference
+            key = f"{self.ProductPath}/telemetry"
+            if key in f:
+                return key
+        raise KeyError("Could not find lowRateTelemetry group in file")
 
     # XXX Base.getOrbit has @pyre.export decorator.  What's that do?
     # XXX L0B doesn't put orbit in MetadataPath
