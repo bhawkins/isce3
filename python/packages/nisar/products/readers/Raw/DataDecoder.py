@@ -1,10 +1,22 @@
 import logging
 from isce3.io import decode_bfpq_lut
-from isce3.core.types import complex32, read_c4_dataset_as_c8
+from isce3.core.types import (complex32, read_c4_dataset_as_c8,
+    complex_byte, read_c2_dataset_as_c8)
 import numpy as np
 
 # TODO some CSV logger
 log = logging.getLogger("Raw")
+
+
+def kludge_lda(shape, key):
+    """Insert a leading zero index if necessary.
+    """
+    ndim = len(shape)
+    has_singleton_lda = (ndim > 1) and (shape[0] == 1)
+    if has_singleton_lda and isinstance(key, tuple) and (len(key) == (ndim-1)):
+        return (0,) + key
+    return key
+
 
 class DataDecoder(object):
     """Handle the various data types floating around for raw data, currently
@@ -27,8 +39,15 @@ class DataDecoder(object):
         self.table = None
         self.decoder = lambda key: self.dataset[key]
         self.dataset = h5dataset
-        self.shape = self.dataset.shape
-        self.ndim = self.dataset.ndim
+        self.shape_storage = self.dataset.shape
+        self.ndim_storage = self.dataset.ndim
+        # SSAR special case
+        if self.ndim_storage == 3 and self.shape_storage[0] == 1:
+            self.ndim = 2
+            self.shape = self.shape_storage[1:]
+        else:
+            self.ndim = self.ndim_storage
+            self.shape = self.shape_storage
         self.dtype = np.dtype('c8')
         # h5py 3.8.0 returns a compound datatype when accessing a complex32
         # dataset's dtype (https://github.com/h5py/h5py/pull/2157).
@@ -48,6 +67,11 @@ class DataDecoder(object):
         elif self.dtype_storage == complex32:
             self.decoder = lambda key: read_c4_dataset_as_c8(self.dataset, key)
             log.info("Decoding raw data from float16 encoding.")
+        elif self.dtype_storage == complex_byte:
+            # SSAR case
+            self.decoder = lambda key: read_c2_dataset_as_c8(self.dataset,
+                kludge_lda(self.dataset.shape, key))
+            log.info("Decoding raw data from int8 encoding.")
         elif self.dtype_storage == np.complex64:
             log.info("Decoding raw data not required")
         else:

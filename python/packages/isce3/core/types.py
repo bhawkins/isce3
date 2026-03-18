@@ -4,6 +4,10 @@ import numpy as np
 
 complex32 = np.dtype([('r', np.float16), ('i', np.float16)])
 
+# NISAR SSAR raw data type.  Given above name, complex16 might give the
+# impression of two 8-bit floats, so use "byte" in the name instead.
+complex_byte = np.dtype([('r', np.int8), ('i', np.int8)])
+
 
 def is_complex32(dataset: h5py.Dataset) -> bool:
     """
@@ -41,6 +45,33 @@ def to_complex32(z: np.array):
     zf['r'] = z.real
     zf['i'] = z.imag
     return zf
+
+
+def read_c2_dataset_as_c8(ds: h5py.Dataset, key=np.s_[...]):
+    """
+    Read a complex int8 HDF5 dataset as a numpy.complex64 array.
+
+    Parameters
+    ----------
+    ds: h5py.Dataset
+        The c2 HDF5 dataset
+    key: numpy.s_
+        Numpy slice to subset input dataset
+
+    Returns
+    -------
+    np.ndarray(numpy.complex64)
+        Complex array (numpy.complex64) from sliced input HDF5 dataset
+    """
+    # Assume we don't have the same h5py grief with integer types.
+    if ds.dtype != complex_byte:
+        return ValueError(f"Expected dtype={complex_byte} but got {ds.dtype}")
+    # TODO benchmark this vs HDF5 built-in type conversion.
+    zi = ds[key]
+    zc = np.zeros(zi.shape, np.complex64)
+    zc.real[:] = zi["r"]
+    zc.imag[:] = zi["i"]
+    return zc
 
 
 def read_c4_dataset_as_c8(ds: h5py.Dataset, key=np.s_[...]):
