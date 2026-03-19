@@ -266,6 +266,8 @@ class RawBase(Base, family='nisar.productreader.raw'):
         if epoch is None:
             return file_epoch, t
         t += (file_epoch - epoch).total_seconds()
+        # SSAR hack to replace NaN values.  TODO use dither sequence
+        t = fill_missing_pulse_times(t)
         return epoch, t
 
     def getNominalPRF(self, frequency='A', tx='H'):
@@ -871,6 +873,7 @@ class RawBase(Base, family='nisar.productreader.raw'):
         nt = len(t)
         assert nt > 1
         if prf:
+            assert (not np.isnan(t[0])) and (not np.isnan(t[-1]))
             nt = 1 + int(np.ceil((t[-1] - t[0]) * prf))
         else:
             prf = (nt - 1) / (t[-1] - t[0])
@@ -880,22 +883,37 @@ class RawBase(Base, family='nisar.productreader.raw'):
         return t, grid
 
 
-    def getSubSwaths(self, frequency='A', tx='H'):
+    def getSubSwaths(self, frequency='A', tx='H', rx=None):
         """Get an array of indices denoting where raw data are valid (e.g., not
         within a transmit gap).  Shape is (ns, nt, 2) where ns is the number of
         sub-swaths and nt is the number of pulse times.  Each pair of numbers
         indicates the [start, end) valid samples.
         """
-        txpath = self.TransmitPath(frequency, tx)
-        with h5py.File(self.filename, 'r', libver='latest', swmr=True) as f:
-            ns = f[txpath]["numberOfSubSwaths"][()]
-            ss1 = f[txpath]["validSamplesSubSwath1"][:]
-            nt = ss1.shape[0]
-            swaths = np.zeros((ns, nt, 2), dtype=int)
-            swaths[0, ...] = ss1
-            for i in range(1, ns):
-                name = f"validSamplesSubSwath{i+1}"
-                swaths[i, ...] = f[txpath][name][:]
+        root = self.TransmitPath(frequency, tx)
+        if rx is not None:
+            root = f"{root}/rx{rx}"
+        try:
+            with h5py.File(self.filename, 'r', libver='latest', swmr=True) as f:
+                ns = f[root]["numberOfSubSwaths"][()]
+                ss1 = f[root]["validSamplesSubSwath1"][:]
+                if ss1.ndim == 3:  # SSAR case
+                    if ss1.shape[0] != 1:
+                        raise NotImplementedError("only support 2D subswaths")
+                    ss1 = ss1[0, ...]
+                nt = ss1.shape[0]
+                swaths = np.zeros((ns, nt, 2), dtype=int)
+                swaths[0, ...] = ss1
+                for i in range(1, ns):
+                    name = f"validSamplesSubSwath{i+1}"
+                    swaths[i, ...] = f[root][name][:]
+        except KeyError:
+            # SSAR hack
+            if rx is None:
+                log.warning(f"validSamplesSubSwath not found in tx{tx} group")
+                rx = [p[1] for p in self.polarizations[frequency] if p[0]==tx][0]
+                log.warning(f"searchig for validSamplesSubSwath in rx{rx} group")
+                return self.getSubSwaths(frequency, tx, rx)
+            raise
         return swaths
 
 
@@ -1448,3 +1466,25 @@ def range_delay_sequential_tx_from_raw(
             delay = 2 * (sr_b.first - sr_a.first) / speed_of_light
             return delay
     return 0.0
+
+
+def fill_missing_pulse_times(t):
+    valid = ~np.isnan(t)
+    nv = np.sum(valid)
+    if nv == 0:
+        raise ValueError("All pulse times are invalid")
+    if nv < len(t):
+        log.warning("Some pulse time tags are invalid.  Replacing with lerp.")
+    pri = np.nanmean(np.diff(t))
+    i = np.arange(len(t))
+    i_valid = i[valid]
+    t_valid = t[valid]
+    ti = np.interp(i, i_valid, t_valid, left=np.nan, right=np.nan)
+    # extrapolate if needed
+    if np.isnan(ti[0]):
+        i0, t0 = i_valid[0], t_valid[0]
+        ti[:i0] = t0 - pri * (1 + np.arange(i0))
+    if np.isnan(ti[-1]):
+        i1, t1 = i_valid[-1], t_valid[-1]
+        ti[i1+1:] = t1 + pri * (1 + np.arange(len(t) - 1 - i1))
+    return ti

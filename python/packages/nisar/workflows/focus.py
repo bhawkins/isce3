@@ -1996,10 +1996,15 @@ def focus(runconfig, runconfig_path=""):
 
             # Compute NESZ if there exist noise-only range lines
             # get noise only range line indexes within processing interval
-            _, cal_path_mask = chirpcorrelator_caltype_from_raw(
-                raw, txrx_pol=pol)
-            _, _, _, idx_noise = get_calib_range_line_idx(
-                cal_path_mask[pulse_begin:pulse_end])
+            try:
+                _, cal_path_mask = chirpcorrelator_caltype_from_raw(
+                    raw, txrx_pol=pol)
+            except KeyError:
+                log.warning("unable to load chirp correlator data")
+                idx_noise = np.array([], int)
+            else:
+                _, _, _, idx_noise = get_calib_range_line_idx(
+                    cal_path_mask[pulse_begin:pulse_end])
 
             # form output slant range vector for all noise products
             if cfg.processing.noise_equivalent_backscatter.fill_nan_ends:

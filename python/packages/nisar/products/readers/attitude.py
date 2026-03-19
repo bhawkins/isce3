@@ -11,7 +11,7 @@ def _require(node: ET.Element, pattern: str) -> ET.Element:
     return x
 
 
-def load_attitude_from_xml(f, epoch: DateTime = None, band="L") -> Attitude:
+def load_attitude_from_xml(f, epoch: DateTime = None, band=None) -> Attitude:
     """Load attitude from XML file.
 
     Parameters
@@ -34,9 +34,13 @@ def load_attitude_from_xml(f, epoch: DateTime = None, band="L") -> Attitude:
     It contains information that may not be parsed or represented in the
     output object.
     """
+    root = ET.parse(f).getroot()  # radarPointing
+    if band is None:
+        band = "L"
+        if root.find("LSAR") is None:
+            band = "S"
     if band not in ("L", "S"):
         raise ValueError(f"Expected band in {{'L', 'S'}} got {band}")
-    root = ET.parse(f).getroot()  # radarPointing
     svl = _require(root, f"{band}SAR/radarPointingStateVectorList")
     n = int(svl.attrib["count"])
     if n <= 0:
