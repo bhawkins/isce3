@@ -550,6 +550,9 @@ def fill_gaps(data, swaths, value=np.complex64(0)):
             [swath for swath in pulse_swaths if swath[1] > swath[0]]
         )
         num_swaths = pulse_swaths.shape[0]
+        # If no valid subswaths, then treat all samples as a gap.
+        if num_swaths < 1:
+            return slice(None)
         # Gap leading up to first swath.
         yield slice(None, pulse_swaths[0, 0])
         # Gaps between swaths.
