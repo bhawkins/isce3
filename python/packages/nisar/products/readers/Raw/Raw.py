@@ -917,7 +917,7 @@ class RawBase(Base, family='nisar.productreader.raw'):
         return swaths
 
 
-    def getSubSwathBboxes(self, frequency, tx=None, epoch=None):
+    def getSubSwathBboxes(self, frequency, polarization=None, epoch=None, num_ignore=0):
         """
         Return the bounding box for each sub-swath.
 
@@ -925,63 +925,107 @@ class RawBase(Base, family='nisar.productreader.raw'):
         ----------
         frequency : {"A", "B"}
             Sub-band identifier.
-        tx : {"H", "V", "L", "R"} | None
-            Transmit polarization. If None, use first available TX polarization.
+        polarization : {'HH', 'HV', 'VH', 'VV', 'RH','RV', 'LH', 'LV'}, optional
+            Transmit-Receive polarization. If not specified, the first
+            polarization in the `frequency` band will be used.
         epoch : isce3.core.DateTime
             Reference epoch for azimuth time tags.
+        num_ignore : int, optional
+            Number of pulses to ignore at the end of an observation.  This
+            option is useful when a fixed-PRF observation is followed by a
+            dithered-PRF one, in which case the gaps in the last few receive
+            windows will have irregular spacing due to the dithered pulses in
+            the air.
 
         Returns
         -------
-        bboxes : list[RadarBoundingBox]
-            Bounding box in radar coordinates for each sub-swath.
+        bboxes : list[list[RadarBoundingBox]]
+            Bounding box in radar coordinates for each sub-swath for each
+            segment of constant data window position/length.
         """
-        if tx is None:
-            tx = self.polarizations[frequency][0][0]
+        if polarization is None:
+            polarization = self.polarizations[frequency][0]
+        tx = polarization[0]
         times, grid = self.getRadarGrid(frequency, tx, epoch=epoch)
+        nt, nr = grid.shape
+        subswaths = self.getSubSwaths(frequency, tx=tx)
+        is_dithered = self.isDithered(frequency, tx=tx, num_ignore=num_ignore)
+        rd, wd, wl = self.getRdWdWl(frequency, polarization)
 
-        # If dithered we can reconstruct the entire swath.
-        if self.isDithered(frequency):
-            bbox = RadarBoundingBox(
-                RadarPoint(times[0], grid.slant_ranges[0]),
-                RadarPoint(times[-1], grid.slant_ranges[-1]))
-            return [bbox]
+        # Replace enormous fill values with number of samples.
+        subswaths = np.where(subswaths > nr, nr, subswaths)
 
-        # Otherwise the TX gaps split the swath into sub-swaths.
-        bboxes = []
-        for swath in self.getSubSwaths(frequency, tx=tx):
-            # For fixed PRF the gap locations should be constant (one unique
-            # pair of [start, stop) indices).
-            if len(np.unique(swath, axis=0)) > 1:
-                log.warning("Variable raw subswaths detected!  Only "
-                    "the swath bounds at the azimuth midpoint will be used.")
+        # Replace last num_ignore pulses with previous value.
+        if (not is_dithered) and (num_ignore > 0):
+            # Avoid problems with trivially short observations, though this
+            # shouldn't ever happen.
+            if num_ignore > nt:
+                log.warning(f"Asked to ignore {num_ignore} pulses but there "
+                    f"are only {nt} total.")
+                num_ignore = nt
+            # NOTE Need singleton middle dimension for proper broadcasting.
+            i = subswaths.shape[1] - num_ignore
+            subswaths[:, i:, :] = subswaths[:, i:(i + 1), :]
 
-            # XXX Careful because radar can transition from constant PRF to
-            # XXX dithered PRF, so the pulses in the air at the end will cause
-            # XXX variations in the gap locations at the end.
-            imid = swath.shape[0] // 2
-            istart, iend = swath[imid, :]
+        # For dithered replace subswaths (gap mask) with a single subswath
+        # that merely tracks min/max valid sample.  Note that gaps may still
+        # interfere with min/max, though.
+        if is_dithered:
+            # Determine non-empty ranges.
+            starts, ends = subswaths[..., 0], subswaths[..., 1]
+            valid = ends > starts
+            # Construct masked arrays to simplify stats.
+            starts = np.ma.array(subswaths[..., 0], mask=~valid)
+            ends = np.ma.array(subswaths[..., 1], mask=~valid)
 
-            r = np.array(grid.slant_ranges)
-            n = len(r)
+            # Get masked min and max valid sample for each pulse.
+            min_starts = np.min(starts, axis=0)
+            max_ends = np.max(ends, axis=0)
 
-            # This transition can also force the introduction of a mostly
-            # empty subswath that's only needed at the end (e.g., only two
-            # gaps except dithering introduces a third).
-            # XXX Empty subswaths should be detectable by istart==iend, but
-            # XXX currently L0B can be populated with weird stuff like
-            # XXX [istart, fillValue) or [fillValue, n) where istart < n and
-            # XXX fillValue > n.  So handle that until L0B writer is fixed.
-            istart = min(istart, n)
-            iend = min(iend, n)
-            if istart >= iend:
-                log.warning(f"Excluding subswath with bounds {swath[imid, :]}.")
+            # Now replace subswaths with a single subswath with start/end
+            # so we can use same logic as fixed PRF below.
+            subswaths = np.vstack((min_starts, max_ends)).transpose().reshape(
+                (1, -1, 2))
+
+        changes = get_dwp_change_indices(rd, wd, wl)
+
+        # Append first and last pulses to generate pairs of constant DWP.
+        breaks = np.hstack(([0], changes, [grid.shape[0] - 1]))
+        bbox_lists = []
+        for ibreak in range(len(breaks) - 1):
+            ipulse0, ipulse1 = breaks[ibreak], breaks[ibreak + 1]
+            t0, t1 = times[ipulse0], times[ipulse1]  # one past end point
+            bboxes = []
+            for iswath, (j0, j1) in enumerate(subswaths[:, ipulse0, :]):
+                # Exclude empty subswaths.
+                if j1 <= j0:
+                    continue
+                # If dithered peek ahead in case gap overlaps start or end of
+                # valid swath.  Only need to check one pulse ahead assuming
+                # dither sequence is correctly designed to avoid consecutive
+                # gaps.
+                if is_dithered:
+                    assert iswath == 0  # due to restructuring above
+                    assert ipulse0 < (nt - 1)  # from construction of breaks
+                    j0next = subswaths[iswath, ipulse0 + 1, 0]
+                    j1next = subswaths[iswath, ipulse0 + 1, 1]
+                    if j1next > j0next:
+                        j0 = min(j0, j0next)
+                        j1 = max(j1, j1next)
+                    else:
+                        log.warning(f"Pulse {ipulse0 + 1} immediately after "
+                            "DWP change has no valid data.  Mask may be wrong.")
+                r0 = grid.slant_ranges[j0]
+                r1 = grid.slant_ranges[j1 - 1] + grid.slant_ranges.spacing
+                bboxes.append(RadarBoundingBox(
+                    RadarPoint(t0, r0),
+                    RadarPoint(t1, r1)))
+            if len(bboxes) == 0:
+                log.warning(f"no valid subswath for time interval [{t0}, {t1})")
                 continue
+            bbox_lists.append(bboxes)
 
-            bbox = RadarBoundingBox(
-                RadarPoint(times[0], r[istart]),
-                RadarPoint(times[-1], r[iend - 1]))
-            bboxes.append(bbox)
-        return bboxes
+        return bbox_lists
 
 
     def getProductLevel(self):
@@ -1107,6 +1151,34 @@ class LegacyRaw(RawBase, family='nisar.productreader.raw'):
 class Raw(RawBase, family='nisar.productreader.raw'):
     # TODO methods for new telemetry fields.
     pass
+
+
+def get_dwp_change_indices(rd, wd, wl):
+    """
+    Determine the pulses where the data window position changes.
+
+    Parameters
+    ----------
+    rd, wd, wl : np.ndarray
+        Arrays with shape (num_channels, num_pulses) containing the range delay,
+        window delay, and window length DBF parameters.  They must all be
+        provided in the same units.
+
+    Returns
+    -------
+    indices : np.ndarray
+        The pulses i where either the min(RD+WD) or the max(RD+WD+WL) changes.
+        That is the pulse at i will have a different data window position than
+        pulse (i - 1).
+    """
+    if not (rd.shape == wd.shape == wl.shape):
+        raise ValueError("shape mismatch among inputs")
+    if not rd.ndim == 2:
+        raise ValueError("expected 2D input data")
+    start = np.min(rd + wd, axis=1).astype(np.int64)
+    end = np.max(rd + wd + wl, axis=1).astype(np.int64)
+    location = np.vstack((start, end))
+    return np.where(np.any(np.diff(location, axis=1) != 0, axis=0))[0] + 1
 
 
 def open_rrsd(filename) -> RawBase:
@@ -1328,6 +1400,14 @@ def chirpcorrelator_caltype_from_raw(
     np.ndarray(uint8)
         1-D array of cal type w/ values HPA=0, LNA=1, BYPASS=2, and INVALID=255
 
+    Notes
+    -----
+    Assumptions for NISAR L-band products in regards
+    to sniffer (BYPASS/LNA) pulses:
+    - The first TX pulse in any datatake is sniffer pulse (BYPASS).
+    - The period of sniffer pulse is always an even number!
+    - The tx=V on odd TX pulses while tx=H on even ones in Quad pol.
+
     """
     try:
         chp_cor = raw._parse_chirpcorrelator_from_hrt_qfsp(txrx_pol=txrx_pol)
@@ -1340,30 +1420,45 @@ def chirpcorrelator_caltype_from_raw(
         chp_cor = raw.getChirpCorrelator(freq_band, txrx_pol[0])
         cal_type = raw.getCalType(freq_band, txrx_pol[0])
         return chp_cor, cal_type
-    # Quad pol case
+    # Linear Quad Pol (QP) case:
+    # TX Cal path type under HRT/QFSP is the same for all
+    # polarizations "txrx_pol". That is, no difference between
+    # H and V!
+    # Both cal type and chirp correlators under HRT/QFSP are
+    # provided over all TX pulses at fastest PRF clock!
     if is_raw_quad_pol(raw):
         tx_pol_first = first_tx_pol_for_quad(raw)
-        if txrx_pol[0] == tx_pol_first:
-            chp_cor = chp_cor[::2]
-            cal_type = cal_type[::2]
-        else:  # the second TX pol
-            # get data from the opposite TX pol
-            x_pol = opposite_linear_pol(txrx_pol[0]) + txrx_pol[1]
-            chp_cor_x, cal_type_x = chirpcorrelator_caltype_from_raw(
-                raw, txrx_pol=x_pol)
-            # if co-pol get HPA value from same TX but
-            # fill in LNA/BYP from opposite TX
-            if txrx_pol[0] == txrx_pol[1]:
-                chp_cor = chp_cor[1::2]
-                cal_type = cal_type[1::2]
-                _, idx_byp, idx_lna, _ = get_calib_range_line_idx(cal_type_x)
-                chp_cor[idx_byp] = chp_cor_x[idx_byp]
-                chp_cor[idx_lna] = chp_cor_x[idx_lna]
-                cal_type[idx_byp] = CalPath.BYPASS
-                cal_type[idx_lna] = CalPath.LNA
-            else:  # x-pol product
-                chp_cor = chp_cor_x
-                cal_type = cal_type_x
+        # check input TX pol against first TX pol in
+        # linear QP to get proper single-pol indexing (slow PRF)
+        # from fast indexing (fast PRF) of HRT.
+        if tx_pol_first == txrx_pol[0]:
+            first_slice = np.s_[::2]
+            second_slice = np.s_[1::2]
+        else:  # the opposite pol
+            first_slice = np.s_[1::2]
+            second_slice = np.s_[::2]
+        # Now check if the input TX pol is H or V.
+        if txrx_pol[0] == 'V':
+            # TX pol = V. No special treatment.
+            chp_cor = chp_cor[first_slice]
+            cal_type = cal_type[first_slice]
+        else:
+            # TX = H pol that requires special
+            # treatment for sniffer pulses (LNA/BYPASS)!
+            # get sniffer pulses from the opposite TX
+            # (other pulse indices) but same receive
+            # to update chirp correlator and cal type.
+            cal_type_x = cal_type[second_slice]
+            chp_cor_x = chp_cor[second_slice]
+            _, idx_byp, idx_lna, _ = get_calib_range_line_idx(cal_type_x)
+            # Parse and update the chirp correlator and cal
+            # type for BYPASS/LNA (sniffer pulses)
+            chp_cor = chp_cor[first_slice]
+            cal_type = cal_type[first_slice]
+            chp_cor[idx_byp] = chp_cor_x[idx_byp]
+            chp_cor[idx_lna] = chp_cor_x[idx_lna]
+            cal_type[idx_byp] = CalPath.BYPASS
+            cal_type[idx_lna] = CalPath.LNA
     # set x-pol HPA to INVALID given they are the mix of
     # LNA from co-pol and HPA from x-pol!
     if txrx_pol in ('HV', 'VH'):
