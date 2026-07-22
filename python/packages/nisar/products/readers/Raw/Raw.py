@@ -950,7 +950,13 @@ class RawBase(Base, family='nisar.productreader.raw'):
         nt, nr = grid.shape
         subswaths = self.getSubSwaths(frequency, tx=tx)
         is_dithered = self.isDithered(frequency, tx=tx, num_ignore=num_ignore)
-        rd, wd, wl = self.getRdWdWl(frequency, polarization)
+        try:
+            rd, wd, wl = self.getRdWdWl(frequency, polarization)
+        except KeyError:
+            # Hack for SSAR.
+            log.warning("Could not find range timing telemetry.  Assuming "
+                "constant timing.")
+            rd = wd = wl = np.zeros((2, 12), dtype=int)
 
         # Replace enormous fill values with number of samples.
         subswaths = np.where(subswaths > nr, nr, subswaths)
